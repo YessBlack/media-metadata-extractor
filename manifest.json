@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Web Content Scraper",
+  "name": "Playlist & Comment Insights",
   "version": "1.0.0",
   "description": "Extrae comentarios de YouTube y canciones de Spotify con facilidad",
   "permissions": ["scripting", "activeTab", "storage"],

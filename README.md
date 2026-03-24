@@ -1,4 +1,4 @@
-# Web Content Scraper
+# Playlist & Comment Insights
 
 Browser extension for structured extraction, normalization, and export of public metadata from YouTube and Spotify web pages.
 
