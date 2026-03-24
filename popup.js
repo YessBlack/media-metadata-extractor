@@ -16,6 +16,31 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 let isYTExtracting = false;
 let isYTPaused = false;
 const ytStateStaleMs = 180000;
+let activeTabId = null;
+let activeYouTubeVideoId = '';
+
+function getYouTubeVideoIdFromUrl(url) {
+    if (!url) {
+        return '';
+    }
+
+    try {
+        const parsed = new URL(url);
+        if (!parsed.hostname.includes('youtube.com')) {
+            return '';
+        }
+        return parsed.searchParams.get('v') || '';
+    } catch (error) {
+        return '';
+    }
+}
+
+async function refreshActiveTabContext() {
+    const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
+    activeTabId = tab?.id || null;
+    activeYouTubeVideoId = getYouTubeVideoIdFromUrl(tab?.url || '');
+    return tab;
+}
 
 function storageGet(keys) {
     return new Promise((resolve, reject) => {
@@ -68,24 +93,75 @@ function storageRemove(keys) {
 // Restore YouTube extraction state when popup opens
 async function restoreYTExtractionState() {
     try {
-        const data = await storageGet('ytExtractionState');
-        if (data.ytExtractionState) {
-            const state = data.ytExtractionState;
+        const tab = await refreshActiveTabContext();
+        if (!tab?.url?.includes('youtube.com')) {
+            return;
+        }
+
+        const data = await storageGet('ytExtractionStates');
+        const states = data?.ytExtractionStates && typeof data.ytExtractionStates === 'object'
+            ? data.ytExtractionStates
+            : {};
+
+        const state = activeYouTubeVideoId ? states[activeYouTubeVideoId] : null;
+
+        if (state) {
 
             if (Date.now() - Number(state.timestamp || 0) > ytStateStaleMs) {
-                await storageRemove('ytExtractionState');
+                delete states[activeYouTubeVideoId];
+                await storageSet({ ytExtractionStates: states });
+                return;
+            }
+
+            const status = document.getElementById('ytStatus');
+            const extractBtn = document.getElementById('extractYTComments');
+            const pauseBtn = document.getElementById('toggleYTPause');
+            const stopBtn = document.getElementById('stopYT');
+
+            const activePhase = state.phase === 'running' || state.phase === 'paused';
+            const isActiveRun = !!state.running && activePhase;
+
+            const renderFinalStatus = () => {
+                const collected = Number(state.collected || 0);
+                const expected = Number(state.expected || 0);
+                extractBtn.disabled = false;
+                pauseBtn.disabled = true;
+                stopBtn.disabled = true;
+                pauseBtn.textContent = 'Pausar';
+                isYTExtracting = false;
+                isYTPaused = false;
+
+                if (state.phase === 'limit') {
+                    status.className = 'status success';
+                    status.textContent = expected > 0
+                        ? `ℹ️ Límite alcanzado (${collected}/${expected})`
+                        : `ℹ️ Límite alcanzado (${collected})`;
+                } else if (state.phase === 'complete') {
+                    const mismatch = expected > 0 && collected < expected;
+                    status.className = 'status success';
+                    status.textContent = mismatch
+                        ? `✅ ${collected} comentarios extraídos (YouTube mostraba ${expected})`
+                        : `✅ ${collected} comentarios extraídos`;
+                } else if (state.phase === 'stopped') {
+                    status.className = 'status success';
+                    status.textContent = `🛑 Proceso detenido (${collected})`;
+                } else {
+                    status.className = 'status';
+                    status.textContent = '';
+                }
+            };
+
+            if (!isActiveRun) {
+                renderFinalStatus();
                 return;
             }
 
             isYTExtracting = true;
             
-            const status = document.getElementById('ytStatus');
-            const extractBtn = document.getElementById('extractYTComments');
-            const pauseBtn = document.getElementById('toggleYTPause');
-            
             // Enable pause button, disable extract button
             extractBtn.disabled = true;
             pauseBtn.disabled = false;
+            stopBtn.disabled = false;
             
             // Restore UI state based on stored state
             if (state.phase === 'paused') {
@@ -110,8 +186,28 @@ async function restoreYTExtractionState() {
                 if (tab?.id && tab.url.includes('youtube.com')) {
                     chrome.tabs.sendMessage(tab.id, {
                         action: 'resumeMonitoring'
-                    }, () => {
-                        // Tab may not have content script loaded
+                    }, async (response) => {
+                        const hasRuntimeError = !!chrome.runtime.lastError;
+                        if (hasRuntimeError || !response?.success) {
+                            const latest = await storageGet('ytExtractionStates');
+                            const latestStates = latest?.ytExtractionStates && typeof latest.ytExtractionStates === 'object'
+                                ? { ...latest.ytExtractionStates }
+                                : {};
+
+                            if (activeYouTubeVideoId && latestStates[activeYouTubeVideoId]) {
+                                delete latestStates[activeYouTubeVideoId];
+                                await storageSet({ ytExtractionStates: latestStates });
+                            }
+
+                            isYTExtracting = false;
+                            isYTPaused = false;
+                            extractBtn.disabled = false;
+                            pauseBtn.disabled = true;
+                            stopBtn.disabled = true;
+                            pauseBtn.textContent = 'Pausar';
+                            status.className = 'status';
+                            status.textContent = '';
+                        }
                     });
                 }
             } catch (error) {
@@ -126,23 +222,36 @@ async function restoreYTExtractionState() {
 // Restore state when popup opens
 document.addEventListener('DOMContentLoaded', restoreYTExtractionState);
 
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, sender) => {
     if (message.action !== 'ytExtractionProgress') {
+        return;
+    }
+
+    const senderTabId = sender?.tab?.id;
+    if (activeTabId && senderTabId && senderTabId !== activeTabId) {
         return;
     }
 
     const status = document.getElementById('ytStatus');
     const payload = message.payload || {};
+    const payloadVideoId = payload.videoId || '';
+    if (activeYouTubeVideoId && payloadVideoId && payloadVideoId !== activeYouTubeVideoId) {
+        return;
+    }
+
     const collected = Number(payload.collected || 0);
     const expected = Number(payload.expected || 0);
     const phase = payload.phase || 'running';
     const extractBtn = document.getElementById('extractYTComments');
     const pauseBtn = document.getElementById('toggleYTPause');
+    const stopBtn = document.getElementById('stopYT');
 
-    isYTExtracting = true;
+    const phaseIsActive = phase === 'running' || phase === 'paused';
+    isYTExtracting = phaseIsActive;
     isYTPaused = phase === 'paused';
-    extractBtn.disabled = true;
-    pauseBtn.disabled = false;
+    extractBtn.disabled = phaseIsActive;
+    pauseBtn.disabled = !phaseIsActive;
+    stopBtn.disabled = !phaseIsActive;
     pauseBtn.textContent = isYTPaused ? 'Reanudar' : 'Pausar';
 
     if (phase === 'running') {
@@ -156,8 +265,19 @@ chrome.runtime.onMessage.addListener((message) => {
             ? `⏸️ Pausado ${collected}/${expected}`
             : `⏸️ Pausado ${collected}`;
     } else if (phase === 'limit') {
-        status.className = 'status loading';
-        status.textContent = `ℹ️ Límite alcanzado (${collected})`; 
+        status.className = 'status success';
+        status.textContent = expected > 0
+            ? `ℹ️ Límite alcanzado (${collected}/${expected})`
+            : `ℹ️ Límite alcanzado (${collected})`;
+    } else if (phase === 'stopped') {
+        status.className = 'status success';
+        status.textContent = `🛑 Proceso detenido (${collected})`;
+    } else if (phase === 'complete') {
+        const mismatch = expected > 0 && collected < expected;
+        status.className = 'status success';
+        status.textContent = mismatch
+            ? `✅ ${collected} comentarios extraídos (YouTube mostraba ${expected})`
+            : `✅ ${collected} comentarios extraídos`;
     }
 });
 
@@ -169,6 +289,7 @@ document.getElementById('extractYTComments').addEventListener('click', async () 
     const downloadBtn = document.getElementById('downloadYT');
     const copyBtn = document.getElementById('copyYT');
     const pauseBtn = document.getElementById('toggleYTPause');
+    const stopBtn = document.getElementById('stopYT');
     const limitInput = document.getElementById('ytLimit');
     const batchSizeInput = document.getElementById('ytBatchSize');
 
@@ -179,6 +300,7 @@ document.getElementById('extractYTComments').addEventListener('click', async () 
     isYTPaused = false;
     extractBtn.disabled = true;
     pauseBtn.disabled = false;
+    stopBtn.disabled = false;
     pauseBtn.textContent = 'Pausar';
 
     status.className = 'status loading';
@@ -194,30 +316,45 @@ document.getElementById('extractYTComments').addEventListener('click', async () 
         if (!tab.url.includes('youtube.com')) {
             throw new Error('Por favor, abre una página de YouTube primero');
         }
-        
-        const response = await chrome.tabs.sendMessage(tab.id, {
-            action: 'extractYTComments',
-            options: {
-                limit,
-                batchSize
+
+        let comments = null;
+
+        try {
+            const response = await chrome.tabs.sendMessage(tab.id, {
+                action: 'extractYTComments',
+                options: { limit, batchSize }
+            });
+
+            if (response && response.success) {
+                comments = response.data;
+            } else if (response) {
+                throw new Error(response.error || 'Error desconocido');
             }
-        });
-        
-        if (response.success) {
-            const comments = response.data;
-            
+        } catch (msgError) {
+            // Chrome's message channel may have timed out (~5 min) while the content
+            // script was still working. Try to recover from storage snapshots saved
+            // during extraction.
+            const stored = await new Promise(resolve =>
+                chrome.storage.local.get('ytComments', result => resolve(result))
+            );
+            if (stored.ytComments && stored.ytComments.length > 0) {
+                comments = stored.ytComments;
+            } else {
+                throw msgError;
+            }
+        }
+
+        if (comments && comments.length > 0) {
             status.className = 'status success';
             status.textContent = `✅ ${comments.length} comentarios extraídos`;
-            
-            // Store data for download
-            chrome.storage.local.set({ytComments: comments});
+
+            chrome.storage.local.set({ ytComments: comments });
             downloadBtn.disabled = false;
             copyBtn.disabled = false;
-            
-            // Show preview
+
             showPreview(preview, comments.slice(0, 5), 'youtube');
         } else {
-            throw new Error(response.error || 'Error desconocido');
+            throw new Error('No se pudieron extraer comentarios. Intenta de nuevo.');
         }
     } catch (error) {
         status.className = 'status error';
@@ -225,9 +362,9 @@ document.getElementById('extractYTComments').addEventListener('click', async () 
     } finally {
         isYTExtracting = false;
         isYTPaused = false;
-        await storageRemove('ytExtractionState');
         extractBtn.disabled = false;
         pauseBtn.disabled = true;
+        stopBtn.disabled = true;
         pauseBtn.textContent = 'Pausar';
     }
 });
@@ -255,14 +392,53 @@ document.getElementById('toggleYTPause').addEventListener('click', async () => {
         });
         
         // Update state in storage with pause status
-        const data = await storageGet('ytExtractionState');
-        if (data.ytExtractionState) {
-            data.ytExtractionState.phase = isYTPaused ? 'paused' : 'running';
-            await storageSet({ytExtractionState: data.ytExtractionState});
+        const data = await storageGet('ytExtractionStates');
+        const states = data?.ytExtractionStates && typeof data.ytExtractionStates === 'object'
+            ? { ...data.ytExtractionStates }
+            : {};
+        if (activeYouTubeVideoId && states[activeYouTubeVideoId]) {
+            states[activeYouTubeVideoId].phase = isYTPaused ? 'paused' : 'running';
+            states[activeYouTubeVideoId].timestamp = Date.now();
+            await storageSet({ ytExtractionStates: states });
         }
 
         status.className = 'status loading';
         status.textContent = isYTPaused ? '⏸️ Extracción pausada' : '⏳ Extracción reanudada';
+    } catch (error) {
+        status.className = 'status error';
+        status.textContent = `❌ ${error.message}`;
+    }
+});
+
+document.getElementById('stopYT').addEventListener('click', async () => {
+    if (!isYTExtracting) {
+        return;
+    }
+
+    const status = document.getElementById('ytStatus');
+    const extractBtn = document.getElementById('extractYTComments');
+    const pauseBtn = document.getElementById('toggleYTPause');
+    const stopBtn = document.getElementById('stopYT');
+
+    try {
+        const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
+        if (!tab?.id || !tab.url.includes('youtube.com')) {
+            throw new Error('Abre YouTube para detener el proceso');
+        }
+
+        await chrome.tabs.sendMessage(tab.id, {
+            action: 'setYTStop'
+        });
+
+        isYTExtracting = false;
+        isYTPaused = false;
+        extractBtn.disabled = false;
+        pauseBtn.disabled = true;
+        stopBtn.disabled = true;
+        pauseBtn.textContent = 'Pausar';
+
+        status.className = 'status success';
+        status.textContent = '🛑 Proceso detenido';
     } catch (error) {
         status.className = 'status error';
         status.textContent = `❌ ${error.message}`;

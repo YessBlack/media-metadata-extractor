@@ -2,16 +2,73 @@
 const ytExtractionControl = {
     paused: false,
     running: false,
+    stopRequested: false,
     lastCollected: 0,
     lastExpected: 0
 };
 
-function removeYTExtractionState() {
+// Reset per extraction run so previous click timestamps don't block future runs.
+let ytButtonClickAt = new WeakMap();
+
+function getCurrentYouTubeVideoId() {
     try {
-        chrome.storage.local.remove('ytExtractionState', () => {
+        // Reset click tracking so previous run's timestamps don't block this run.
+    ytButtonClickAt = new WeakMap();
+
+    if (!window.location.hostname.includes('youtube.com')) {
+            return '';
+        }
+        const url = new URL(window.location.href);
+        return url.searchParams.get('v') || '';
+    } catch (error) {
+        return '';
+    }
+}
+
+function cleanupYTOnPageExit() {
+    try {
+        if (!ytExtractionControl.running) {
+            return;
+        }
+
+        const videoId = getCurrentYouTubeVideoId();
+        if (videoId) {
+            removeYTExtractionState(videoId);
+        }
+    } catch (error) {
+        // ignore
+    }
+}
+
+window.addEventListener('beforeunload', cleanupYTOnPageExit);
+window.addEventListener('pagehide', cleanupYTOnPageExit);
+
+function removeYTExtractionState(videoId) {
+    if (!videoId) {
+        return;
+    }
+
+    try {
+        chrome.storage.local.get('ytExtractionStates', (result) => {
             if (chrome.runtime.lastError) {
-                // ignore
+                return;
             }
+
+            const states = result?.ytExtractionStates && typeof result.ytExtractionStates === 'object'
+                ? { ...result.ytExtractionStates }
+                : {};
+
+            if (!(videoId in states)) {
+                return;
+            }
+
+            delete states[videoId];
+
+            chrome.storage.local.set({ ytExtractionStates: states }, () => {
+                if (chrome.runtime.lastError) {
+                    // ignore
+                }
+            });
         });
     } catch (error) {
         // ignore
@@ -19,11 +76,29 @@ function removeYTExtractionState() {
 }
 
 function saveYTExtractionState(state) {
+    const videoId = state?.videoId;
+    if (!videoId) {
+        return;
+    }
+
     try {
-        chrome.storage.local.set({ ytExtractionState: state }, () => {
+        chrome.storage.local.get('ytExtractionStates', (result) => {
             if (chrome.runtime.lastError) {
-                console.warn('Failed to save extraction state:', chrome.runtime.lastError.message);
+                console.warn('Failed to read extraction states:', chrome.runtime.lastError.message);
+                return;
             }
+
+            const states = result?.ytExtractionStates && typeof result.ytExtractionStates === 'object'
+                ? { ...result.ytExtractionStates }
+                : {};
+
+            states[videoId] = state;
+
+            chrome.storage.local.set({ ytExtractionStates: states }, () => {
+                if (chrome.runtime.lastError) {
+                    console.warn('Failed to save extraction state:', chrome.runtime.lastError.message);
+                }
+            });
         });
     } catch (error) {
         console.warn('Failed to save extraction state:', error);
@@ -34,22 +109,35 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === 'extractYTComments') {
         ytExtractionControl.running = true;
         ytExtractionControl.paused = false;
+        ytExtractionControl.stopRequested = false;
+        const videoId = getCurrentYouTubeVideoId();
 
         extractYouTubeComments(request.options || {}).then(data => {
             sendResponse({success: true, data: data});
             // Clear extraction state when complete
-            removeYTExtractionState();
+            removeYTExtractionState(videoId);
         }).catch(error => {
             sendResponse({success: false, error: error.message});
         }).finally(() => {
             ytExtractionControl.running = false;
             ytExtractionControl.paused = false;
+            ytExtractionControl.stopRequested = false;
         });
         return true; // Will respond asynchronously
     } else if (request.action === 'setYTPause') {
         ytExtractionControl.paused = !!request.paused;
         sendYTProgress({
             phase: ytExtractionControl.paused ? 'paused' : 'running',
+            collected: ytExtractionControl.lastCollected,
+            expected: ytExtractionControl.lastExpected
+        });
+        sendResponse({ success: true });
+        return true;
+    } else if (request.action === 'setYTStop') {
+        ytExtractionControl.stopRequested = true;
+        ytExtractionControl.paused = false;
+        sendYTProgress({
+            phase: 'stopped',
             collected: ytExtractionControl.lastCollected,
             expected: ytExtractionControl.lastExpected
         });
@@ -72,23 +160,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 });
 
-// YouTube Comments Extraction
+// YouTube Comments Extraction — same philosophy as Spotify:
+// window.scroll drives loading, user scroll also helps, MutationObserver captures everything.
 async function extractYouTubeComments(options = {}) {
     const commentsMap = new Map();
     const limit = Math.max(Number.parseInt(options.limit || '0', 10) || 0, 0);
     const batchSize = Math.max(Number.parseInt(options.batchSize || '50', 10) || 50, 10);
     let lastProgressCount = 0;
     let lastProgressSentAt = 0;
-    
-    // Make sure we're on a YouTube page
+
     if (!window.location.hostname.includes('youtube.com')) {
         throw new Error('Esta página no es un video de YouTube');
     }
-
     if (!window.location.pathname.includes('/watch')) {
         throw new Error('Abre un video de YouTube en la vista /watch para extraer comentarios');
     }
 
+    // --- Step 1: scroll until the comments section appears ---
     const commentsSection = await ensureYouTubeCommentsSectionLoaded();
     if (!commentsSection) {
         throw new Error('No se encontró la sección de comentarios. Puede estar desactivada para este video.');
@@ -100,19 +188,21 @@ async function extractYouTubeComments(options = {}) {
         : (limit > 0 ? limit : expectedTotal);
 
     collectVisibleYouTubeComments(commentsMap);
-    maybeSendYTProgress();
+    sendProgressSnapshot('running');
 
-    const startTime = Date.now();
+    // --- Step 2: hook user scroll + MutationObserver (same as Spotify) ---
     let lastGrowthAt = Date.now();
-    const maxRuntimeMs = expectedTotal > 0 ? 21600000 : 10800000;
-    const visibleGrowthIdleTimeoutMs = expectedTotal > 0 ? 180000 : 120000;
-    const hiddenGrowthIdleTimeoutMs = expectedTotal > 0 ? 900000 : 420000;
+    let lastInteractionAt = Date.now();
 
-    const onAnyActivity = (event) => {
+    const onUserScroll = (event) => {
+        if (event?.isTrusted) {
+            lastInteractionAt = Date.now();
+        }
         const before = commentsMap.size;
         collectVisibleYouTubeComments(commentsMap);
         if (commentsMap.size > before) {
             lastGrowthAt = Date.now();
+            sendProgressSnapshot('running');
         }
     };
 
@@ -124,140 +214,210 @@ async function extractYouTubeComments(options = {}) {
         }
     });
 
-    window.addEventListener('scroll', onAnyActivity, { passive: true });
-    window.addEventListener('wheel', onAnyActivity, { passive: true });
-    window.addEventListener('touchmove', onAnyActivity, { passive: true });
-    window.addEventListener('keydown', onAnyActivity);
+    window.addEventListener('scroll', onUserScroll, { passive: true });
+    window.addEventListener('wheel', onUserScroll, { passive: true });
+    window.addEventListener('touchmove', onUserScroll, { passive: true });
 
-    observer.observe(commentsSection instanceof HTMLElement ? commentsSection : document.body, {
-        childList: true,
-        subtree: true
-    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // --- Step 3: drive window scroll downward, collect after each step ---
+    const startTime = Date.now();
+    const maxRuntimeMs = 600000; // 10 min hard cap
+
+    const step = Math.max(Math.floor(window.innerHeight * 0.85), 600);
+
+    // Track the last time any new comment was collected (wall-clock time).
+    // We stop when NO new comment appears for idleStopMs in a row,
+    // regardless of pending buttons — YouTube's counter is unreliable and
+    // pending detection can get stuck on already-expanded threads.
+    const idleStopMs = 10000; // 10 s with zero new comments → done
+    let noGrowthStreak = 0;   // kept for bounce triggering only
+    const noGrowthLimit = 12;
 
     try {
-        let rounds = 0;
-        const maxRounds = expectedTotal > 0
-            ? Math.min(Math.max(Math.ceil(expectedTotal * 3), 4000), 40000)
-            : 12000;
-
-        while (Date.now() - startTime < maxRuntimeMs && rounds < maxRounds) {
+        let iteration = 0;
+        while (Date.now() - startTime < maxRuntimeMs) {
+            if (ytExtractionControl.stopRequested) break;
             await waitIfYTPaused(commentsMap.size, effectiveExpected);
+            if (ytExtractionControl.stopRequested) break;
+
+            // Click any "show replies" / "load more" buttons that are visible.
+            const repliesClicked = expandVisibleYouTubeReplies();
+            if (iteration % 3 === 0) expandVisibleYouTubeMoreButtons();
 
             const beforeCount = commentsMap.size;
-            const previousScrollY = window.scrollY;
 
-            if (rounds % 2 === 0) {
-                expandVisibleYouTubeReplies();
+            // If we just clicked reply buttons, wait for YouTube to load them
+            // and collect BEFORE scrolling away from them.
+            // Note: we do NOT reset lastGrowthAt here — only actual new comments do that.
+            if (repliesClicked > 0) {
+                await new Promise(resolve => setTimeout(resolve, document.hidden ? 2200 : 1400));
+                const beforeReplies = commentsMap.size;
+                collectVisibleYouTubeComments(commentsMap);
+                if (commentsMap.size > beforeReplies) lastGrowthAt = Date.now();
+                // Second pass — some replies load in two batches.
+                await new Promise(resolve => setTimeout(resolve, document.hidden ? 1200 : 700));
+                const beforeReplies2 = commentsMap.size;
+                collectVisibleYouTubeComments(commentsMap);
+                if (commentsMap.size > beforeReplies2) lastGrowthAt = Date.now();
             }
-            if (rounds % 5 === 0) {
-                expandVisibleYouTubeMoreButtons();
-            }
 
-            collectVisibleYouTubeComments(commentsMap);
-
-            const step = Math.max(Math.floor(window.innerHeight * 0.92), 680);
             window.scrollBy(0, step);
-            await new Promise(resolve => setTimeout(resolve, document.hidden ? 1700 : 850));
+            await new Promise(resolve => setTimeout(resolve, document.hidden ? 1600 : 900));
 
             collectVisibleYouTubeComments(commentsMap);
-            maybeSendYTProgress();
+            sendProgressSnapshot('running');
+
             if (commentsMap.size > beforeCount) {
                 lastGrowthAt = Date.now();
+                noGrowthStreak = 0;
+            } else {
+                noGrowthStreak++;
             }
 
+            // Limit reached — done.
             if (effectiveExpected > 0 && commentsMap.size >= effectiveExpected) {
-                sendYTProgress({
-                    phase: 'limit',
-                    collected: commentsMap.size,
-                    expected: effectiveExpected
-                });
+                sendProgressSnapshot('limit');
                 break;
             }
 
-            const reachedBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 8;
-            const scrollDidNotMove = Math.abs(window.scrollY - previousScrollY) < 2;
-
-            if (reachedBottom && scrollDidNotMove) {
-                window.scrollBy(0, -Math.max(Math.floor(window.innerHeight * 0.4), 320));
-                await new Promise(resolve => setTimeout(resolve, document.hidden ? 700 : 300));
-                window.scrollBy(0, Math.max(Math.floor(window.innerHeight * 0.8), 620));
-                await new Promise(resolve => setTimeout(resolve, document.hidden ? 1600 : 700));
+            // When stuck, bounce hard to re-trigger YouTube's lazy loader network request.
+            if (noGrowthStreak > 0 && noGrowthStreak % 4 === 0) {
+                window.scrollBy(0, -Math.max(Math.floor(window.innerHeight * 0.5), 380));
+                await new Promise(resolve => setTimeout(resolve, document.hidden ? 1000 : 500));
+                window.scrollBy(0, step * 1.5);
+                await new Promise(resolve => setTimeout(resolve, document.hidden ? 1800 : 1000));
+                const beforeBounce = commentsMap.size;
                 collectVisibleYouTubeComments(commentsMap);
-            }
-
-            const growthIdleMs = Date.now() - lastGrowthAt;
-            const growthIdleTimeoutMs = document.hidden ? hiddenGrowthIdleTimeoutMs : visibleGrowthIdleTimeoutMs;
-
-            if (growthIdleMs > growthIdleTimeoutMs) {
-                const beforeRecovery = commentsMap.size;
-
-                for (let i = 0; i < 3; i++) {
-                    expandVisibleYouTubeReplies();
-                    expandVisibleYouTubeMoreButtons();
-                    window.scrollBy(0, -Math.max(Math.floor(window.innerHeight * 0.5), 420));
-                    await new Promise(resolve => setTimeout(resolve, document.hidden ? 1300 : 600));
-                    window.scrollBy(0, Math.max(Math.floor(window.innerHeight * 1.1), 900));
-                    await new Promise(resolve => setTimeout(resolve, document.hidden ? 2200 : 1100));
-                }
-
-                collectVisibleYouTubeComments(commentsMap);
-                maybeSendYTProgress(true);
-
-                if (commentsMap.size > beforeRecovery) {
-                    lastGrowthAt = Date.now();
-                } else if (effectiveExpected > 0 && commentsMap.size >= Math.floor(effectiveExpected * 0.98)) {
-                    break;
+                if (commentsMap.size > beforeBounce) {
+                    noGrowthStreak = 0;
+                    lastGrowthAt = Date.now(); // only reset if we actually got new comments
                 }
             }
 
-            rounds++;
+            // Stop when no new comment has appeared for idleStopMs. Give YouTube
+            // one extra timeout window if it still shows continuation/reply loaders.
+            const sinceLastGrowth = Date.now() - lastGrowthAt;
+            const stillHasPending = hasPendingYouTubeContinuationOrReplies();
+            if (
+                sinceLastGrowth >= idleStopMs &&
+                (!stillHasPending || sinceLastGrowth >= idleStopMs * 3)
+            ) {
+                break;
+            }
+
+            // Periodic small scroll-up every 30 iterations to keep lazy-load fresh.
+            if (iteration > 0 && iteration % 30 === 0) {
+                window.scrollBy(0, -Math.max(Math.floor(window.innerHeight * 0.3), 220));
+                await new Promise(resolve => setTimeout(resolve, 200));
+            }
+
+            iteration++;
         }
     } finally {
         observer.disconnect();
-        window.removeEventListener('scroll', onAnyActivity);
-        window.removeEventListener('wheel', onAnyActivity);
-        window.removeEventListener('touchmove', onAnyActivity);
-        window.removeEventListener('keydown', onAnyActivity);
+        window.removeEventListener('scroll', onUserScroll);
+        window.removeEventListener('wheel', onUserScroll);
+        window.removeEventListener('touchmove', onUserScroll);
     }
 
-    const comments = Array.from(commentsMap.values());
-
-    if (comments.length === 0) {
+    // Fallback pass on threads already in DOM in case the map is still empty.
+    if (commentsMap.size === 0) {
         collectYouTubeCommentsFallback(commentsMap);
     }
 
     const finalComments = Array.from(commentsMap.values());
+    const wasStopped = ytExtractionControl.stopRequested;
 
     if (limit > 0 && finalComments.length > limit) {
         return finalComments.slice(0, limit);
     }
-    
-    if (finalComments.length === 0) {
+
+    if (!wasStopped && finalComments.length === 0) {
         throw new Error('No se pudieron extraer comentarios. Intenta de nuevo.');
     }
-    
+
+    const finalPhase = wasStopped
+        ? 'stopped'
+        : (effectiveExpected > 0 && finalComments.length >= effectiveExpected ? 'limit' : 'complete');
+    sendProgressSnapshot(finalPhase);
+
+    // Always persist so popup can recover from storage if the message channel timed out.
+    try { chrome.storage.local.set({ ytComments: finalComments }); } catch (e) { /* ignore */ }
+
     return finalComments;
 
-    function maybeSendYTProgress(force = false) {
-        const now = Date.now();
-        const heartbeatMs = document.hidden ? 12000 : 6000;
-        const reachedBatch = commentsMap.size - lastProgressCount >= batchSize || commentsMap.size === 0;
-        const reachedHeartbeat = now - lastProgressSentAt >= heartbeatMs;
+    // ---- helpers scoped to this extraction run ----
 
-        if (force || reachedBatch || reachedHeartbeat) {
-            sendYTProgress({
-                phase: 'running',
-                collected: commentsMap.size,
-                expected: effectiveExpected
-            });
-            lastProgressCount = commentsMap.size;
-            lastProgressSentAt = now;
-        }
+    function sendProgressSnapshot(phase) {
+        const now = Date.now();
+        const heartbeatMs = document.hidden ? 10000 : 5000;
+        const reachedBatch = commentsMap.size - lastProgressCount >= batchSize;
+        const reachedHeartbeat = now - lastProgressSentAt >= heartbeatMs;
+        const forced = phase !== 'running';
+
+        if (!forced && !reachedBatch && !reachedHeartbeat) return;
+
+        sendYTProgress({
+            phase,
+            collected: commentsMap.size,
+            expected: effectiveExpected
+        });
+        lastProgressCount = commentsMap.size;
+        lastProgressSentAt = now;
     }
 }
 
+function resolveYouTubeScrollDriver(commentsSection) {
+    const candidates = [];
+
+    if (commentsSection instanceof HTMLElement) {
+        const commentsContent =
+            commentsSection.querySelector('#contents') ||
+            commentsSection.querySelector('ytd-item-section-renderer #contents') ||
+            commentsSection;
+
+        let node = commentsContent instanceof HTMLElement ? commentsContent : commentsSection;
+        while (node && node !== document.body) {
+            if (isElementScrollable(node)) {
+                candidates.push({ type: 'element', element: node });
+            }
+            node = node.parentElement;
+        }
+    }
+
+    candidates.push({ type: 'window', element: null });
+
+    return candidates[0];
+}
+
+function driveYouTubeScrollDriver(driver, deltaY) {
+    if (driver?.type === 'element' && driver.element) {
+        driver.element.scrollTop += deltaY;
+        return;
+    }
+
+    window.scrollBy(0, deltaY);
+}
+
+function getYouTubeDriverOffset(driver) {
+    if (driver?.type === 'element' && driver.element) {
+        return driver.element.scrollTop;
+    }
+
+    return window.scrollY;
+}
+
+function isYouTubeDriverNearBottom(driver) {
+    if (driver?.type === 'element' && driver.element) {
+        return driver.element.scrollTop + driver.element.clientHeight >= driver.element.scrollHeight - 8;
+    }
+
+    return window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 8;
+}
+
 async function waitIfYTPaused(collected, expected) {
-    while (ytExtractionControl.running && ytExtractionControl.paused) {
+    while (ytExtractionControl.running && ytExtractionControl.paused && !ytExtractionControl.stopRequested) {
         sendYTProgress({
             phase: 'paused',
             collected,
@@ -271,10 +431,16 @@ function sendYTProgress(payload) {
     ytExtractionControl.lastCollected = Number(payload?.collected || 0);
     ytExtractionControl.lastExpected = Number(payload?.expected || 0);
 
+    const videoId = getCurrentYouTubeVideoId() || 'unknown';
+    const enrichedPayload = {
+        ...payload,
+        videoId
+    };
+
     try {
         chrome.runtime.sendMessage({
             action: 'ytExtractionProgress',
-            payload
+            payload: enrichedPayload
         });
     } catch (error) {
         // Popup might be closed; ignore.
@@ -282,7 +448,6 @@ function sendYTProgress(payload) {
     
     // Save state to storage for persistence when popup closes
     const videoUrl = window.location.href;
-    const videoId = new URL(videoUrl).searchParams.get('v') || 'unknown';
     
     saveYTExtractionState({
         videoId,
@@ -294,6 +459,15 @@ function sendYTProgress(payload) {
         paused: payload.phase === 'paused',
         timestamp: Date.now()
     });
+
+    // Persist comments snapshot so popup can recover if message channel times out.
+    if (Array.isArray(payload.comments) && payload.comments.length > 0) {
+        try {
+            chrome.storage.local.set({ ytComments: payload.comments });
+        } catch (e) {
+            // ignore
+        }
+    }
 }
 
 // Spotify Tracks Extraction
@@ -320,7 +494,7 @@ async function extractSpotifyTracks() {
 async function extractSpotifyTracksFromDom() {
     const tracksByPosition = new Map();
 
-    const trackElements = document.querySelectorAll('[role="row"][aria-rowindex] [data-testid="tracklist-row"], [role="row"][aria-rowindex]');
+    const trackElements = await waitForSpotifyTrackRows();
 
     if (trackElements.length === 0) {
         throw new Error('No se encontraron canciones. Asegúrate de estar en una lista de reproducción.');
@@ -454,6 +628,26 @@ async function extractSpotifyTracksFromDom() {
     }
 
     return tracks;
+}
+
+async function waitForSpotifyTrackRows(maxWaitMs = 12000) {
+    const selector = '[role="row"][aria-rowindex] [data-testid="tracklist-row"], [role="row"][aria-rowindex]';
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < maxWaitMs) {
+        const rows = document.querySelectorAll(selector);
+        if (rows.length > 0) {
+            return rows;
+        }
+
+        // Force lazy sections to render.
+        window.scrollBy(0, Math.max(Math.floor(window.innerHeight * 0.6), 420));
+        await new Promise(resolve => setTimeout(resolve, 320));
+        window.scrollBy(0, -Math.max(Math.floor(window.innerHeight * 0.3), 210));
+        await new Promise(resolve => setTimeout(resolve, 220));
+    }
+
+    return document.querySelectorAll(selector);
 }
 
 async function resolveSpotifySongViewport(trackRoot, firstRow) {
@@ -667,20 +861,24 @@ function collectVisibleYouTubeComments(commentsMap) {
             const text = getYouTubeCommentText(element);
             const date = getYouTubeCommentDate(element);
             const commentId = getYouTubeCommentId(element);
+            const likes = getLikesCount(element);
+            const reply = isCommentReply(element);
+            const parentId = reply ? getYouTubeParentCommentId(element) : '';
 
             if (!author || !text) {
                 continue;
             }
 
-            const key = commentId || `${author}__${text}__${date}`;
+            const key = commentId || `${author}__${text}__${date}__${likes}__${reply ? 'r' : 'c'}`;
             if (!commentsMap.has(key)) {
                 commentsMap.set(key, {
                     id: commentId || undefined,
                     author,
                     text,
                     date,
-                    likes: getLikesCount(element),
-                    isReply: isCommentReply(element),
+                    likes,
+                    isReply: reply,
+                    parentId: parentId || undefined,
                     timestamp: new Date().toISOString()
                 });
             }
@@ -697,6 +895,29 @@ function getYouTubeCommentId(element) {
     const href = permalink?.getAttribute('href') || '';
     const match = href.match(/[?&]lc=([^&]+)/);
     return match?.[1] || '';
+}
+
+function getYouTubeParentCommentId(element) {
+    try {
+        const thread = element.closest('ytd-comment-thread-renderer');
+        if (!thread) {
+            return '';
+        }
+
+        const candidates = thread.querySelectorAll('ytd-comment-renderer, ytd-comment-view-model');
+        for (const candidate of candidates) {
+            if (candidate === element) {
+                continue;
+            }
+            if (!isCommentReply(candidate)) {
+                return getYouTubeCommentId(candidate) || '';
+            }
+        }
+
+        return '';
+    } catch (error) {
+        return '';
+    }
 }
 
 function getYouTubeAuthor(element) {
@@ -759,22 +980,55 @@ async function ensureYouTubeCommentsSectionLoaded() {
 }
 
 function expandVisibleYouTubeReplies() {
-    const replyButtons = document.querySelectorAll(
-        'ytd-button-renderer #button[aria-label*="respuestas"], ' +
-        'ytd-button-renderer #button[aria-label*="replies"], ' +
-        'ytd-comment-replies-renderer #more-replies, ' +
-        '#more-replies #button'
+    // From real YouTube HTML (2025):
+    // Structure: ytd-comment-replies-renderer
+    //   #collapsed-threads > yt-sub-thread > .show-replies-button
+    //     > #more-replies-sub-thread > yt-button-shape > button[aria-label="N respuestas"]
+    // Also the older path:
+    //   #expander > .more-button > #more-replies > yt-button-shape > button
+    // Both buttons have aria-label with the reply count text.
+    // We click buttons whose aria-label contains a reply-count pattern.
+
+    // All <button> elements inside reply renderer structures
+    const candidates = document.querySelectorAll(
+        'ytd-comment-replies-renderer #more-replies-sub-thread yt-button-shape button, ' +
+        'ytd-comment-replies-renderer #more-replies yt-button-shape button, ' +
+        '.show-replies-button yt-button-shape button, ' +
+        'ytd-comment-replies-renderer .more-button yt-button-shape button'
     );
 
-    for (const button of Array.from(replyButtons).slice(0, 120)) {
+    let clicked = 0;
+    for (const button of Array.from(candidates).slice(0, 200)) {
         try {
-            if (button instanceof HTMLElement && button.offsetParent !== null) {
-                button.click();
-            }
+            if (!(button instanceof HTMLElement)) continue;
+            if (!canClickYouTubeControl(button)) continue;
+
+            const label = (button.getAttribute('aria-label') || '').toLowerCase();
+            const text  = (button.textContent || '').toLowerCase();
+
+            // Match: "2 respuestas", "14 replies", "Ver 3 respuestas", etc.
+            // Do NOT match "Ocultar respuestas" (hide replies) or "Responder" (reply action)
+            const isHide = label.includes('ocultar') || label.includes('hide') || label.includes('less');
+            const isReplyAction = (label === 'responder' || label === 'reply');
+            if (isHide || isReplyAction) continue;
+
+            const isShowReplies =
+                /\d+\s*(respuesta|repli|reply)/.test(label) ||
+                /\d+\s*(respuesta|repli|reply)/.test(text) ||
+                label.includes('respuesta') ||
+                label.includes('repl');
+
+            if (!isShowReplies) continue;
+
+            button.click();
+            markYouTubeControlClicked(button);
+            clicked++;
         } catch (e) {
-            // Ignore click issues.
+            // Ignore
         }
     }
+
+    return clicked;
 }
 
 function expandVisibleYouTubeMoreButtons() {
@@ -782,17 +1036,117 @@ function expandVisibleYouTubeMoreButtons() {
         '#more-replies #button, ' +
         '#more-text #button, ' +
         'tp-yt-paper-button#more, ' +
-        'ytd-comment-renderer #more'
+        'ytd-comment-renderer #more, ' +
+        'ytd-continuation-item-renderer #button, ' +
+        'ytd-continuation-item-renderer tp-yt-paper-button, ' +
+        'ytd-comment-replies-renderer #continuation #button, ' +
+        '#continuations #button, ' +
+        '#continuations tp-yt-paper-button, ' +
+        'ytd-comments #continuation #button, ' +
+        'ytd-comments #continuations #button, ' +
+        'button[aria-label*="more"], ' +
+        'button[aria-label*="más"], ' +
+        'tp-yt-paper-button[aria-label*="more"], ' +
+        'tp-yt-paper-button[aria-label*="más"]'
     );
 
-    for (const button of Array.from(buttons).slice(0, 80)) {
+    let clicked = 0;
+    for (const button of Array.from(buttons).slice(0, 120)) {
         try {
-            if (button instanceof HTMLElement && button.offsetParent !== null) {
+            if (button instanceof HTMLElement && canClickYouTubeControl(button)) {
                 button.click();
+                markYouTubeControlClicked(button);
+                clicked++;
             }
         } catch (e) {
             // Ignore click issues.
         }
+    }
+
+    return clicked;
+}
+
+function hasPendingYouTubeContinuationOrReplies() {
+    const container = document.querySelector('ytd-comments') || document.querySelector('#comments');
+    if (!container) {
+        return false;
+    }
+
+    // Unexpanded reply threads: look for reply buttons whose container is NOT yet expanded.
+    // After expanding, YouTube sets aria-expanded="true" on the parent .more-button div
+    // and hides the #expander entirely. We only count buttons that are still collapsed.
+    const unexpandedReplyButtons = container.querySelectorAll(
+        'ytd-comment-replies-renderer #more-replies-sub-thread yt-button-shape button, ' +
+        'ytd-comment-replies-renderer .more-button[aria-expanded="false"] yt-button-shape button, ' +
+        'ytd-comment-replies-renderer #more-replies yt-button-shape button'
+    );
+    for (const btn of unexpandedReplyButtons) {
+        if (!(btn instanceof HTMLElement)) continue;
+        if (btn.offsetParent === null) continue;
+        const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+        const isHide = label.includes('ocultar') || label.includes('hide');
+        const isReplyAction = (label === 'responder' || label === 'reply');
+        if (isHide || isReplyAction) continue;
+        // Only count as pending if the parent expander is not hidden
+        const expander = btn.closest('#expander, .more-button');
+        if (expander && expander.hasAttribute('hidden')) continue;
+        if (/\d+\s*(respuesta|repli|reply)/.test(label) || label.includes('respuesta') || label.includes('repl')) {
+            return true;
+        }
+    }
+
+    // Continuation spinners and load-more buttons
+    const pendingIndicators = container.querySelectorAll(
+        'ytd-comment-replies-renderer tp-yt-paper-spinner, ' +
+        '#continuations tp-yt-paper-spinner, ' +
+        '#continuation tp-yt-paper-spinner, ' +
+        'ytd-continuation-item-renderer tp-yt-paper-spinner, ' +
+        '#continuations ytd-continuation-item-renderer, ' +
+        '#continuation ytd-continuation-item-renderer, ' +
+        'ytd-continuation-item-renderer.replies-continuation'
+    );
+    for (const indicator of pendingIndicators) {
+        if (indicator instanceof HTMLElement && indicator.offsetParent !== null) {
+            return true;
+        }
+    }
+
+    const loadMoreButtons = container.querySelectorAll(
+        '#continuations #button, ' +
+        '#continuation #button, ' +
+        'ytd-continuation-item-renderer #button, ' +
+        'tp-yt-paper-button#more'
+    );
+    for (const button of loadMoreButtons) {
+        if (button instanceof HTMLElement && button.offsetParent !== null) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function canClickYouTubeControl(button) {
+    if (!(button instanceof HTMLElement)) {
+        return false;
+    }
+
+    if (button.offsetParent === null) {
+        return false;
+    }
+
+    if (button.hasAttribute('disabled') || button.getAttribute('aria-disabled') === 'true') {
+        return false;
+    }
+
+    const lastClickedAt = ytButtonClickAt.get(button) || 0;
+    const cooldownMs = 2500;
+    return Date.now() - lastClickedAt > cooldownMs;
+}
+
+function markYouTubeControlClicked(button) {
+    if (button instanceof HTMLElement) {
+        ytButtonClickAt.set(button, Date.now());
     }
 }
 

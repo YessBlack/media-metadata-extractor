@@ -99,10 +99,17 @@ h2 {
 
 .yt-options {
     display: grid;
-    grid-template-columns: 1fr 1fr auto;
+    grid-template-columns: 1fr 1fr;
     gap: 8px;
     margin-bottom: 10px;
     align-items: end;
+}
+
+.yt-option-actions {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
 }
 
 .yt-options label {
@@ -121,7 +128,12 @@ h2 {
 }
 
 .yt-options #toggleYTPause {
-    min-width: 92px;
+    min-width: 0;
+    height: 36px;
+}
+
+.yt-options #stopYT {
+    min-width: 0;
     height: 36px;
 }
 
