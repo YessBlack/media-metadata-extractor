@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Web Content Scraper</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="container">
+      <h1>🔍 Web Content Scraper</h1>
+
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="youtube">YouTube</button>
+        <button class="tab-btn" data-tab="spotify">Spotify</button>
+      </div>
+
+      <!-- YouTube Tab -->
+      <div id="youtube" class="tab-content active">
+        <h2>Extraer Comentarios de YouTube</h2>
+        <div class="info-box">
+          <p>Cargará automáticamente todos los comentarios del video actual.</p>
+          <small
+            >Nota: Esto puede tardar unos segundos dependiendo de la cantidad de
+            comentarios.</small
+          >
+        </div>
+
+        <div class="yt-options">
+          <label>
+            Límite
+            <input
+              id="ytLimit"
+              type="number"
+              min="0"
+              step="1"
+              value="0"
+              placeholder="0 = sin límite"
+            />
+          </label>
+          <label>
+            Lote
+            <input
+              id="ytBatchSize"
+              type="number"
+              min="10"
+              step="10"
+              value="50"
+            />
+          </label>
+          <button id="toggleYTPause" class="btn btn-secondary" disabled>
+            Pausar
+          </button>
+        </div>
+
+        <div class="controls">
+          <button id="extractYTComments" class="btn btn-primary">
+            Extraer Comentarios
+          </button>
+          <button id="copyYT" class="btn btn-secondary" disabled>Copiar</button>
+          <button id="downloadYT" class="btn btn-secondary" disabled>
+            Descargar JSON
+          </button>
+        </div>
+
+        <div class="status" id="ytStatus"></div>
+        <div class="preview" id="ytPreview"></div>
+      </div>
+
+      <!-- Spotify Tab -->
+      <div id="spotify" class="tab-content">
+        <h2>Extraer Canciones de Spotify</h2>
+        <div class="info-box">
+          <p>Extrae las canciones de la playlist.</p>
+          <small
+            >Nota: Si la lista es muy larga, después de dar en "Extraer
+            canciones" desplázate arriba/abajo por la tabla para cargar
+            todas.</small
+          >
+        </div>
+
+        <div class="controls">
+          <button id="extractSpotify" class="btn btn-primary">
+            Extraer Canciones
+          </button>
+          <button id="copySpotify" class="btn btn-secondary" disabled>
+            Copiar
+          </button>
+          <button id="downloadSpotify" class="btn btn-secondary" disabled>
+            Descargar JSON
+          </button>
+        </div>
+
+        <div class="status" id="spotifyStatus"></div>
+        <div class="preview" id="spotifyPreview"></div>
+      </div>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

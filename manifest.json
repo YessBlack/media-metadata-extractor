@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Web Content Scraper",
+  "version": "1.0.0",
+  "description": "Extrae comentarios de YouTube y canciones de Spotify con facilidad",
+  "permissions": ["scripting", "activeTab", "storage"],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://open.spotify.com/*",
+    "https://api.spotify.com/*",
+    "https://*.youtube.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Web Content Scraper"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://*.youtube.com/*",
+        "https://open.spotify.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_end"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
