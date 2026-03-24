@@ -1,16 +1,16 @@
 # Playlist & Comment Insights
 
-Browser extension for structured extraction, normalization, and export of public metadata from YouTube and Spotify web pages.
+Browser extension for structured extraction and export of metadata from YouTube and Spotify web pages.
 
 This project was built as a personal engineering exercise and evolved into a practical tool for comment analytics workflows and playlist data organization.
 
 ## Overview
 
-Web Content Scraper focuses on **data processing and interoperability**:
+This extension focuses on **data extraction and interoperability**:
 
 - Extracts YouTube comment metadata for analysis pipelines.
 - Extracts Spotify playlist track metadata for cataloging and cleanup workflows.
-- Normalizes output into machine-readable formats for BI, scripting, and research tasks.
+- Exports machine-readable JSON for BI, scripting, and research tasks.
 
 The extension runs locally in the browser and is designed for iterative data collection on dynamic pages (virtualized lists, lazy-loaded comments, long-running sessions).
 
@@ -23,35 +23,19 @@ The extension runs locally in the browser and is designed for iterative data col
 
 - **Spotify playlist metadata extraction**
   - Track name, artist(s), album, duration, explicit flag, and extraction timestamp.
+  - API-first extraction with DOM fallback when needed.
   - Handles long playlists with dynamic/virtualized DOM rendering.
 
 - **Data export and handoff**
   - JSON export from the popup UI.
   - Quick copy-to-clipboard for ad hoc processing.
-  - Output is ready for downstream conversion to CSV in Python, pandas, Sheets, or ETL tools.
+  - Output is ready for downstream conversion to CSV using external tools (Python/pandas, Sheets, or ETL pipelines).
 
-- **Operational robustness**
+- **Operational robustness (YouTube)**
   - Background-tolerant progress state for long extraction sessions.
   - Popup state restoration when reopening the extension UI.
 
-## Example Data Patterns
-
-### Input normalization example
-
-Raw title-like string:
-
-```text
-01. Artist Name - Track Title (Official Video)
-```
-
-Normalized record shape:
-
-```json
-{
-  "artist": "Artist Name",
-  "trackName": "Track Title"
-}
-```
+## Example Output
 
 ### YouTube output sample
 
@@ -107,13 +91,15 @@ Normalized record shape:
 1. Open a Spotify web playlist.
 2. Open the extension popup and select the **Spotify** tab.
 3. Click **Extraer Canciones**.
-4. Export the result as JSON or copy it for processing.
+4. If the playlist is long, scroll the table while extraction runs so additional rows are rendered.
+5. Export the result as JSON or copy it for processing.
 
 ## Export & Analysis Workflow
 
-- Primary export format: **JSON**.
-- Typical next steps:
-  - Convert JSON to CSV via Python/pandas.
+- Built-in outputs: **JSON export** and **copy to clipboard**.
+- CSV conversion is **not built into the extension** and is done externally.
+- Typical post-processing steps:
+  - Convert JSON to CSV via Python/pandas or spreadsheet tools.
   - Join playlist/comment data with other datasets.
   - Perform sentiment analysis, topic clustering, or engagement metrics.
 
